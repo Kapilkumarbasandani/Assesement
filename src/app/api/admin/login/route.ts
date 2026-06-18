@@ -13,8 +13,8 @@ export async function POST(request: NextRequest) {
     const envPassword = process.env.ADMIN_PASSWORD || "admin123";
     const passwordHash = bcrypt.hashSync(envPassword, 10);
 
-    ensureDefaultAdmin(envUsername, passwordHash);
-    updateAdminPassword(envUsername, passwordHash);
+    await ensureDefaultAdmin(envUsername, passwordHash);
+    await updateAdminPassword(envUsername, passwordHash);
 
     const { username, password } = await request.json();
     const trimmedUser = username?.trim();
@@ -27,7 +27,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const admin = getAdminByUsername(trimmedUser);
+    const admin = await getAdminByUsername(trimmedUser);
     if (!admin || !bcrypt.compareSync(trimmedPass, admin.password_hash)) {
       return NextResponse.json(
         { error: "Invalid credentials." },
@@ -46,7 +46,8 @@ export async function POST(request: NextRequest) {
     });
 
     return response;
-  } catch {
+  } catch (error) {
+    console.error("Admin login error:", error);
     return NextResponse.json({ error: "Login failed." }, { status: 500 });
   }
 }

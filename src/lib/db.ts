@@ -1,56 +1,70 @@
-import Database from "better-sqlite3";
+import { createClient, type Client } from "@libsql/client";
 import path from "path";
 import fs from "fs";
-import os from "os";
 
-function getDbPath(): string {
-  if (process.env.DATABASE_PATH) {
-    return process.env.DATABASE_PATH;
+let client: Client | null = null;
+let schemaReady: Promise<void> | null = null;
+
+function getClient(): Client {
+  if (client) return client;
+
+  const tursoUrl = process.env.TURSO_DATABASE_URL;
+  const tursoToken = process.env.TURSO_AUTH_TOKEN;
+
+  if (tursoUrl) {
+    client = createClient({
+      url: tursoUrl,
+      authToken: tursoToken,
+    });
+  } else {
+    const dataDir = path.join(process.cwd(), "data");
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+    const dbFile = process.env.DATABASE_PATH || path.join(dataDir, "acea.db");
+    client = createClient({ url: `file:${dbFile}` });
   }
-  if (process.env.VERCEL) {
-    return path.join(os.tmpdir(), "acea-assessment.db");
-  }
-  const dataDir = path.join(process.cwd(), "data");
-  if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-  }
-  return path.join(dataDir, "assesment.db");
+
+  return client;
 }
 
-const dbPath = getDbPath();
-const db = new Database(dbPath);
-db.pragma("journal_mode = WAL");
-db.exec(`
-  CREATE TABLE IF NOT EXISTS admins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-
-  CREATE TABLE IF NOT EXISTS participants (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    full_name TEXT NOT NULL,
-    email TEXT NOT NULL,
-    organization TEXT NOT NULL,
-    department TEXT,
-    job_title TEXT,
-    phone TEXT,
-    started_at TEXT DEFAULT (datetime('now')),
-    completed_at TEXT,
-    status TEXT DEFAULT 'in_progress'
-  );
-
-  CREATE TABLE IF NOT EXISTS responses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    participant_id INTEGER NOT NULL,
-    question_id INTEGER NOT NULL,
-    answer TEXT NOT NULL,
-    answered_at TEXT DEFAULT (datetime('now')),
-    FOREIGN KEY (participant_id) REFERENCES participants(id),
-    UNIQUE(participant_id, question_id)
-  );
-`);
+async function ensureSchema(): Promise<void> {
+  if (!schemaReady) {
+    schemaReady = (async () => {
+      const db = getClient();
+      await db.batch([
+        `CREATE TABLE IF NOT EXISTS admins (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          username TEXT UNIQUE NOT NULL,
+          password_hash TEXT NOT NULL,
+          created_at TEXT DEFAULT (datetime('now'))
+        )`,
+        `CREATE TABLE IF NOT EXISTS participants (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          full_name TEXT NOT NULL,
+          email TEXT NOT NULL,
+          organization TEXT NOT NULL,
+          department TEXT,
+          job_title TEXT,
+          phone TEXT,
+          started_at TEXT DEFAULT (datetime('now')),
+          completed_at TEXT,
+          status TEXT DEFAULT 'in_progress'
+        )`,
+        `CREATE TABLE IF NOT EXISTS responses (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          participant_id INTEGER NOT NULL,
+          question_id INTEGER NOT NULL,
+          answer TEXT NOT NULL,
+          answered_at TEXT DEFAULT (datetime('now')),
+          FOREIGN KEY (participant_id) REFERENCES participants(id),
+          UNIQUE(participant_id, question_id)
+        )`,
+      ]);
+    })();
+  }
+  await schemaReady;
+}
 
 export interface Participant {
   id: number;
@@ -77,88 +91,159 @@ export interface ParticipantWithResponses extends Participant {
   responses: Response[];
 }
 
-export function createParticipant(data: {
+function rowToParticipant(row: Record<string, unknown>): Participant {
+  return {
+    id: Number(row.id),
+    full_name: String(row.full_name),
+    email: String(row.email),
+    organization: String(row.organization),
+    department: row.department != null ? String(row.department) : null,
+    job_title: row.job_title != null ? String(row.job_title) : null,
+    phone: row.phone != null ? String(row.phone) : null,
+    started_at: String(row.started_at),
+    completed_at: row.completed_at != null ? String(row.completed_at) : null,
+    status: String(row.status),
+  };
+}
+
+function rowToResponse(row: Record<string, unknown>): Response {
+  return {
+    id: Number(row.id),
+    participant_id: Number(row.participant_id),
+    question_id: Number(row.question_id),
+    answer: String(row.answer),
+    answered_at: String(row.answered_at),
+  };
+}
+
+export async function createParticipant(data: {
   full_name: string;
   email: string;
   organization: string;
   department?: string;
   job_title?: string;
   phone?: string;
-}): number {
-  const stmt = db.prepare(`
-    INSERT INTO participants (full_name, email, organization, department, job_title, phone)
-    VALUES (@full_name, @email, @organization, @department, @job_title, @phone)
-  `);
-  const result = stmt.run({
-    full_name: data.full_name,
-    email: data.email,
-    organization: data.organization,
-    department: data.department || null,
-    job_title: data.job_title || null,
-    phone: data.phone || null,
+}): Promise<number> {
+  await ensureSchema();
+  const db = getClient();
+  const result = await db.execute({
+    sql: `INSERT INTO participants (full_name, email, organization, department, job_title, phone)
+          VALUES (?, ?, ?, ?, ?, ?)`,
+    args: [
+      data.full_name,
+      data.email,
+      data.organization,
+      data.department || null,
+      data.job_title || null,
+      data.phone || null,
+    ],
   });
-  return result.lastInsertRowid as number;
+  return Number(result.lastInsertRowid);
 }
 
-export function getParticipant(id: number): Participant | undefined {
-  return db
-    .prepare("SELECT * FROM participants WHERE id = ?")
-    .get(id) as Participant | undefined;
+export async function getParticipant(
+  id: number
+): Promise<Participant | undefined> {
+  await ensureSchema();
+  const db = getClient();
+  const result = await db.execute({
+    sql: "SELECT * FROM participants WHERE id = ?",
+    args: [id],
+  });
+  if (result.rows.length === 0) return undefined;
+  return rowToParticipant(result.rows[0] as Record<string, unknown>);
 }
 
-export function saveResponse(
+export async function saveResponse(
   participantId: number,
   questionId: number,
   answer: string
-): void {
-  db.prepare(`
-    INSERT INTO responses (participant_id, question_id, answer)
-    VALUES (?, ?, ?)
-    ON CONFLICT(participant_id, question_id) DO UPDATE SET answer = excluded.answer, answered_at = datetime('now')
-  `).run(participantId, questionId, answer);
+): Promise<void> {
+  await ensureSchema();
+  const db = getClient();
+  await db.execute({
+    sql: `INSERT INTO responses (participant_id, question_id, answer)
+          VALUES (?, ?, ?)
+          ON CONFLICT(participant_id, question_id)
+          DO UPDATE SET answer = excluded.answer, answered_at = datetime('now')`,
+    args: [participantId, questionId, answer],
+  });
 }
 
-export function completeParticipant(participantId: number): void {
-  db.prepare(`
-    UPDATE participants SET status = 'completed', completed_at = datetime('now') WHERE id = ?
-  `).run(participantId);
+export async function completeParticipant(participantId: number): Promise<void> {
+  await ensureSchema();
+  const db = getClient();
+  await db.execute({
+    sql: `UPDATE participants SET status = 'completed', completed_at = datetime('now') WHERE id = ?`,
+    args: [participantId],
+  });
 }
 
-export function getAllParticipants(): ParticipantWithResponses[] {
-  const participants = db
-    .prepare("SELECT * FROM participants ORDER BY started_at DESC")
-    .all() as Participant[];
-
-  const responseStmt = db.prepare(
-    "SELECT * FROM responses WHERE participant_id = ? ORDER BY question_id"
+export async function getAllParticipants(): Promise<ParticipantWithResponses[]> {
+  await ensureSchema();
+  const db = getClient();
+  const participantsResult = await db.execute(
+    "SELECT * FROM participants ORDER BY started_at DESC"
+  );
+  const participants = participantsResult.rows.map((r) =>
+    rowToParticipant(r as Record<string, unknown>)
   );
 
-  return participants.map((p) => ({
-    ...p,
-    responses: responseStmt.all(p.id) as Response[],
-  }));
+  const withResponses: ParticipantWithResponses[] = [];
+  for (const p of participants) {
+    const responsesResult = await db.execute({
+      sql: "SELECT * FROM responses WHERE participant_id = ? ORDER BY question_id",
+      args: [p.id],
+    });
+    withResponses.push({
+      ...p,
+      responses: responsesResult.rows.map((r) =>
+        rowToResponse(r as Record<string, unknown>)
+      ),
+    });
+  }
+  return withResponses;
 }
 
-export function getAdminByUsername(username: string) {
-  return db
-    .prepare("SELECT * FROM admins WHERE username = ?")
-    .get(username) as { id: number; username: string; password_hash: string } | undefined;
+export async function getAdminByUsername(username: string) {
+  await ensureSchema();
+  const db = getClient();
+  const result = await db.execute({
+    sql: "SELECT * FROM admins WHERE username = ?",
+    args: [username],
+  });
+  if (result.rows.length === 0) return undefined;
+  const row = result.rows[0] as Record<string, unknown>;
+  return {
+    id: Number(row.id),
+    username: String(row.username),
+    password_hash: String(row.password_hash),
+  };
 }
 
-export function ensureDefaultAdmin(username: string, passwordHash: string): void {
-  const existing = getAdminByUsername(username);
+export async function ensureDefaultAdmin(
+  username: string,
+  passwordHash: string
+): Promise<void> {
+  await ensureSchema();
+  const existing = await getAdminByUsername(username);
   if (!existing) {
-    db.prepare(
-      "INSERT INTO admins (username, password_hash) VALUES (?, ?)"
-    ).run(username, passwordHash);
+    const db = getClient();
+    await db.execute({
+      sql: "INSERT INTO admins (username, password_hash) VALUES (?, ?)",
+      args: [username, passwordHash],
+    });
   }
 }
 
-export function updateAdminPassword(username: string, passwordHash: string): void {
-  db.prepare("UPDATE admins SET password_hash = ? WHERE username = ?").run(
-    passwordHash,
-    username
-  );
+export async function updateAdminPassword(
+  username: string,
+  passwordHash: string
+): Promise<void> {
+  await ensureSchema();
+  const db = getClient();
+  await db.execute({
+    sql: "UPDATE admins SET password_hash = ? WHERE username = ?",
+    args: [passwordHash, username],
+  });
 }
-
-export default db;

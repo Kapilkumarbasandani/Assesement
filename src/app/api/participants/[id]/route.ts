@@ -13,7 +13,15 @@ export async function POST(
   try {
     const { id } = await params;
     const participantId = parseInt(id, 10);
-    const participant = getParticipant(participantId);
+
+    if (isNaN(participantId)) {
+      return NextResponse.json(
+        { error: "Invalid participant ID." },
+        { status: 400 }
+      );
+    }
+
+    const participant = await getParticipant(participantId);
 
     if (!participant) {
       return NextResponse.json(
@@ -33,7 +41,7 @@ export async function POST(
     const { questionId, answer, complete } = body;
 
     if (complete) {
-      completeParticipant(participantId);
+      await completeParticipant(participantId);
       return NextResponse.json({ success: true, completed: true });
     }
 
@@ -52,16 +60,17 @@ export async function POST(
       );
     }
 
-    saveResponse(participantId, questionId, String(answer));
+    await saveResponse(participantId, questionId, String(answer));
 
     const isLast = questionId === TOTAL_QUESTIONS;
     if (isLast) {
-      completeParticipant(participantId);
+      await completeParticipant(participantId);
       return NextResponse.json({ success: true, completed: true });
     }
 
     return NextResponse.json({ success: true, completed: false });
-  } catch {
+  } catch (error) {
+    console.error("Save response error:", error);
     return NextResponse.json(
       { error: "Failed to save response." },
       { status: 500 }

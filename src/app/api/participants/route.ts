@@ -22,7 +22,7 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    const participantId = createParticipant({
+    const participantId = await createParticipant({
       full_name: full_name.trim(),
       email: email.trim(),
       organization: organization.trim(),
@@ -32,7 +32,8 @@ export async function POST(request: NextRequest) {
     });
 
     return NextResponse.json({ participantId });
-  } catch {
+  } catch (error) {
+    console.error("Create participant error:", error);
     return NextResponse.json(
       { error: "Failed to register participant." },
       { status: 500 }
